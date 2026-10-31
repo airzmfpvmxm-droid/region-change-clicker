@@ -97,7 +97,7 @@ public sealed class Panel : Form {
         StartPosition=FormStartPosition.CenterScreen; Font=new Font("맑은 고딕",10);
         BackColor=Color.FromArgb(246,248,252); KeyPreview=true;
         Label title=new Label { Text="영역 변화 감지",Font=new Font(Font.FontFamily,19,FontStyle.Bold),Bounds=new Rectangle(24,20,450,40) }; Controls.Add(title);
-        Controls.Add(new Label { Text="1초마다 확인 → 변화 위치 1회 클릭 → 자동 정지",Bounds=new Rectangle(24,66,455,26) });
+        Controls.Add(new Label { Text="0.3초마다 확인 → 변화 위치 1회 클릭 → 자동 정지",Bounds=new Rectangle(24,66,455,26) });
         area=new Label { Text="선택된 영역 없음",Bounds=new Rectangle(24,108,450,26) }; Controls.Add(area);
         select=ButtonAt("영역 선택",24,141,140); select.Click+=delegate { Choose(); };
         bind=ButtonAt("단축키 변경",180,141,140); bind.Click+=delegate { Stop("새 단축키를 누르세요."); capturingKey=true; keyLabel.Text="키 입력 대기 (Esc 취소)"; };
@@ -106,7 +106,7 @@ public sealed class Panel : Form {
         tolerance=new NumericUpDown { Minimum=0,Maximum=254,Value=0,Bounds=new Rectangle(365,225,105,28) }; Controls.Add(tolerance);
         toggle=ButtonAt("감지 시작",24,272,140); toggle.Click+=delegate { Toggle(); };
         status=new Label { Text="대기 중",Bounds=new Rectangle(180,275,290,65) }; Controls.Add(status);
-        timer.Interval=1000; timer.Tick+=delegate { Tick(); };
+        timer.Interval=300; timer.Tick+=delegate { Tick(); };
         Shown+=delegate { if(!Native.RegisterHotKey(Handle,hotkeyId,0x4000, (uint)Keys.F8)) { hotkey=Keys.None; status.Text="F8 사용 중: 단축키를 변경하세요."; } UpdateKey(); };
         KeyDown+=OnKey;
         FormClosing+=delegate { timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
@@ -158,7 +158,7 @@ public sealed class Panel : Form {
             if(!RegionValid()) { Stop("화면 구성이 변경되어 정지했습니다."); return; }
             if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { Stop("패널이 감지 영역에 겹쳐 정지했습니다."); return; }
             using(Bitmap image=CaptureRegion()) {
-                if(pending) { detector.Start(image); pending=false; status.Text="감지 중 · 1초 간격"; return; }
+                if(pending) { detector.Start(image); pending=false; status.Text="감지 중 · 0.3초 간격"; return; }
                 detector.Check(image,(int)tolerance.Value,delegate(Point local) {
                     Point target=new Point(region.X+local.X,region.Y+local.Y);
                     Stop("변화 감지: 클릭 전송 중…"); Native.Click(target);
