@@ -1,6 +1,7 @@
 using System;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -39,6 +40,43 @@ public sealed class OneShot : IDisposable {
         return true;
     }
     public void Dispose() { if (baseline != null) { baseline.Dispose(); baseline = null; } }
+}
+public sealed class RepeatDetection : IDisposable {
+    readonly OneShot detector=new OneShot();
+    readonly Func<long> now;
+    bool waiting;
+    long resumeAt;
+    int maximum, cooldown;
+    public bool Active { get; private set; }
+    public int Completed { get; private set; }
+    public bool Waiting { get { return Active && waiting; } }
+    public long RemainingMilliseconds { get { return Waiting ? Math.Max(0,resumeAt-now()) : 0; } }
+    public RepeatDetection() {
+        Stopwatch clock=Stopwatch.StartNew(); now=delegate { return clock.ElapsedMilliseconds; };
+    }
+    public RepeatDetection(Func<long> clock) { if(clock==null)throw new ArgumentNullException("clock"); now=clock; }
+    public void Start(Bitmap image,int maximumClicks,int cooldownMilliseconds) {
+        if(maximumClicks<1 || maximumClicks>10000)throw new ArgumentOutOfRangeException("maximumClicks");
+        if(cooldownMilliseconds<0 || cooldownMilliseconds>600000)throw new ArgumentOutOfRangeException("cooldownMilliseconds");
+        Dispose(); maximum=maximumClicks; cooldown=cooldownMilliseconds; Completed=0;
+        detector.Start(image); Active=true;
+    }
+    public bool Check(Bitmap image,int tolerance,Action<Point> click) {
+        if(!Active)return false;
+        try {
+            if(waiting) {
+                if(now()<resumeAt)return false;
+                // Rebase after the cooldown: a persistent change and click effects are not new events.
+                detector.Start(image); waiting=false; return false;
+            }
+            return detector.Check(image,tolerance,delegate(Point p) {
+                click(p); Completed++;
+                if(Completed>=maximum)Dispose();
+                else { waiting=true; resumeAt=now()+cooldown; }
+            });
+        } catch { Dispose(); throw; }
+    }
+    public void Dispose() { Active=false; waiting=false; detector.Dispose(); }
 }
 static class Native {
     [DllImport("user32.dll", SetLastError=true)] internal static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint key);
@@ -84,20 +122,20 @@ sealed class Selector : Form {
     }
 }
 public sealed class Panel : Form {
-    readonly OneShot detector=new OneShot();
+    readonly RepeatDetection detector=new RepeatDetection();
     readonly Timer timer=new Timer();
     Rectangle region; bool selecting, capturingKey, pending;
     Keys hotkey=Keys.F8; int hotkeyId=1;
     Label status, area, keyLabel;
     Button select, toggle, bind;
-    NumericUpDown tolerance, interval;
+    NumericUpDown tolerance, interval, repetitions, cooldown;
     public Panel() {
-        Text="영역 변화 클릭 매크로"; ClientSize=new Size(500,400);
+        Text="영역 변화 클릭 매크로"; ClientSize=new Size(500,505);
         FormBorderStyle=FormBorderStyle.FixedSingle; MaximizeBox=false;
         StartPosition=FormStartPosition.CenterScreen; Font=new Font("맑은 고딕",10);
         BackColor=Color.FromArgb(246,248,252); KeyPreview=true;
         Label title=new Label { Text="영역 변화 감지",Font=new Font(Font.FontFamily,19,FontStyle.Bold),Bounds=new Rectangle(24,20,450,40) }; Controls.Add(title);
-        Controls.Add(new Label { Text="설정한 간격으로 확인 → 변화 위치 1회 클릭 → 자동 정지",Bounds=new Rectangle(24,66,455,26) });
+        Controls.Add(new Label { Text="변화 위치 클릭 → 쿨타임 → 설정 횟수까지 감지",Bounds=new Rectangle(24,66,455,26) });
         area=new Label { Text="선택된 영역 없음",Bounds=new Rectangle(24,108,450,26) }; Controls.Add(area);
         select=ButtonAt("영역 선택",24,141,140); select.Click+=delegate { Choose(); };
         bind=ButtonAt("단축키 변경",180,141,140); bind.Click+=delegate { Stop("새 단축키를 누르세요."); capturingKey=true; keyLabel.Text="키 입력 대기 (Esc 취소)"; };
@@ -106,14 +144,19 @@ public sealed class Panel : Form {
         tolerance=new NumericUpDown { Minimum=0,Maximum=254,Value=0,Bounds=new Rectangle(365,225,105,28) }; Controls.Add(tolerance);
         Controls.Add(new Label { Text="감지 간격 (초 · 0.05~60)",Bounds=new Rectangle(24,268,325,26) });
         interval=new NumericUpDown { Minimum=0.05m,Maximum=60m,DecimalPlaces=2,Increment=0.05m,Value=0.30m,Bounds=new Rectangle(365,265,105,28) }; Controls.Add(interval);
-        toggle=ButtonAt("감지 시작",24,317,140); toggle.Click+=delegate { Toggle(); };
-        status=new Label { Text="대기 중",Bounds=new Rectangle(180,320,290,65) }; Controls.Add(status);
+        Controls.Add(new Label { Text="최대 클릭 횟수 (총 1~10000회)",Bounds=new Rectangle(24,308,325,26) });
+        repetitions=new NumericUpDown { Minimum=1,Maximum=10000,Value=1,Bounds=new Rectangle(365,305,105,28) }; Controls.Add(repetitions);
+        Controls.Add(new Label { Text="클릭 후 쿨타임 (초 · 0~600)",Bounds=new Rectangle(24,348,325,26) });
+        cooldown=new NumericUpDown { Minimum=0,Maximum=600,DecimalPlaces=2,Increment=0.1m,Value=1m,Bounds=new Rectangle(365,345,105,28) }; Controls.Add(cooldown);
+        Controls.Add(new Label { Text="쿨타임이 끝난 화면을 새 기준으로 다음 변화 감지",Bounds=new Rectangle(24,385,450,26) });
+        toggle=ButtonAt("감지 시작",24,427,140); toggle.Click+=delegate { Toggle(); };
+        status=new Label { Text="대기 중",Bounds=new Rectangle(180,427,290,65) }; Controls.Add(status);
         timer.Interval=300; timer.Tick+=delegate { Tick(); };
         Shown+=delegate { if(!Native.RegisterHotKey(Handle,hotkeyId,0x4000, (uint)Keys.F8)) { hotkey=Keys.None; status.Text="F8 사용 중: 단축키를 변경하세요."; } UpdateKey(); };
         KeyDown+=OnKey;
         FormClosing+=delegate { timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
-        Resize+=delegate { if(detector.Active) Stop("창 상태 변경으로 정지했습니다."); };
-        LocationChanged+=delegate { if(detector.Active) Stop("창 이동으로 정지했습니다."); };
+        Resize+=delegate { if(detector.Active || pending) Stop("창 상태 변경으로 정지했습니다."); };
+        LocationChanged+=delegate { if(detector.Active || pending) Stop("창 이동으로 정지했습니다."); };
     }
     Button ButtonAt(string text,int x,int y,int w) { Button b=new Button { Text=text,Bounds=new Rectangle(x,y,w,36) }; Controls.Add(b); return b; }
     void UpdateKey() { keyLabel.Text="ON / OFF 단축키: "+(hotkey==Keys.None?"미설정":new KeysConverter().ConvertToString(hotkey)); }
@@ -152,21 +195,28 @@ public sealed class Panel : Form {
         if(!RegionValid()) { status.Text="유효한 화면 영역을 선택하세요."; return; }
         if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { status.Text="컨트롤 패널을 감지 영역 밖으로 옮기세요."; return; }
         timer.Interval=decimal.ToInt32(interval.Value*1000m);
-        pending=true; select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=false; toggle.Text="감지 정지";
+        pending=true; Editing(false); toggle.Text="감지 정지";
         status.Text="기준 화면 준비 중…"; timer.Start();
     }
-    void Stop(string text) { timer.Stop(); pending=false; detector.Dispose(); select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=true; toggle.Text="감지 시작"; status.Text=text; }
+    void Editing(bool enabled) { select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=repetitions.Enabled=cooldown.Enabled=enabled; }
+    void Stop(string text) { timer.Stop(); pending=false; detector.Dispose(); Editing(true); toggle.Text="감지 시작"; status.Text=text; }
+    void DetectionStatus() {
+        string progress=string.Format("{0}/{1}회",detector.Completed,(int)repetitions.Value);
+        status.Text=detector.Waiting ? string.Format("{0} · 쿨타임 {1:0.00}초",progress,detector.RemainingMilliseconds/1000m)
+            : string.Format("{0} · 감지 중 ({1:0.##}초)",progress,timer.Interval/1000m);
+    }
     void Tick() {
         try {
             if(!RegionValid()) { Stop("화면 구성이 변경되어 정지했습니다."); return; }
             if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { Stop("패널이 감지 영역에 겹쳐 정지했습니다."); return; }
             using(Bitmap image=CaptureRegion()) {
-                if(pending) { detector.Start(image); pending=false; status.Text="감지 중 · "+(timer.Interval/1000m).ToString("0.##")+"초 간격"; return; }
+                if(pending) { detector.Start(image,(int)repetitions.Value,decimal.ToInt32(cooldown.Value*1000m)); pending=false; DetectionStatus(); return; }
                 detector.Check(image,(int)tolerance.Value,delegate(Point local) {
                     Point target=new Point(region.X+local.X,region.Y+local.Y);
-                    Stop("변화 감지: 클릭 전송 중…"); Native.Click(target);
-                    status.Text=string.Format("클릭 완료 ({0}, {1}) · 자동 정지",target.X,target.Y);
+                    Native.Click(target);
                 });
+                if(!detector.Active)Stop(string.Format("{0}회 클릭 완료 · 자동 정지",detector.Completed));
+                else DetectionStatus();
             }
         } catch(Exception ex) { Stop("오류로 정지: "+ex.Message); }
     }
