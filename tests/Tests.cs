@@ -1,10 +1,15 @@
 using System;
 using System.Drawing;
 using RegionChangeClicker;
+using System.IO;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 class Tests {
     static int checks;
     static void Assert(bool condition,string name) { if(!condition)throw new Exception(name); checks++; }
-    static void Main() {
+    [STAThread] static void Main() {
         using(Bitmap a=new Bitmap(8,8)) using(Bitmap b=new Bitmap(8,8)) {
             using(Graphics g=Graphics.FromImage(a))g.Clear(Color.Black);
             using(Graphics g=Graphics.FromImage(b))g.Clear(Color.Black);
@@ -28,7 +33,57 @@ class Tests {
             }
         }
         RepeatTests();
+        using(RegionChangeClicker.Panel panel=new RegionChangeClicker.Panel()) {
+            panel.CreateControl();
+            Assert(panel.Controls.Count>20,"Integrated panel initializes");
+        }
+        SynchronizationContext.SetSynchronizationContext(null);
+        MacroTests().GetAwaiter().GetResult();
         Console.WriteLine("PASS: "+checks+" assertions (no real mouse input)");
+    }
+    static async Task MacroTests() {
+        MacroStep[] source={ new MacroStep { Kind=StepKind.PositionClick,X=-20,Y=30,Button=2 },new MacroStep {Kind=StepKind.Delay,Milliseconds=500},new MacroStep {Kind=StepKind.Text,Text="한글 {a}+"},new MacroStep {Kind=StepKind.Key,Key=Keys.Control|Keys.A} };
+        MacroStep[] armed=MacroRunner.Snapshot(source); source[2].Text="mutated";
+        Assert(armed[2].Text=="한글 {a}+","Armed macro immutable snapshot");
+        List<string> events=new List<string>(); int progress=0;
+        await MacroRunner.RunAsync(armed,new Point(1,2),delegate(MacroStep step,Point p) { Assert(p==new Point(1,2),"Detection point passed to macro"); events.Add(step.Kind.ToString()); },CancellationToken.None,delegate(int i) { Assert(i==progress++,"Ordered progress"); },delegate(int ms,CancellationToken t) { Assert(ms==500,"Recorded delay honored"); events.Add("Delay"); return Task.FromResult(0); });
+        Assert(string.Join(",",events)=="PositionClick,Delay,Text,Key","Mixed steps replay in order");
+        using(CancellationTokenSource stop=new CancellationTokenSource()) {
+            TaskCompletionSource<bool> entered=new TaskCompletionSource<bool>(); int count=0;
+            Task run=MacroRunner.RunAsync(armed,Point.Empty,delegate {count++;},stop.Token,null,delegate(int ms,CancellationToken t) {entered.SetResult(true);return Task.Delay(600000,t);});
+            await entered.Task; stop.Cancel(); bool canceled=false;
+            try {await run;}catch(OperationCanceledException){canceled=true;}
+            Assert(canceled && count==1,"Cancel during delay skips remaining inputs");
+        }
+        int sent=0; bool failed=false;
+        try {await MacroRunner.RunAsync(armed,Point.Empty,delegate {sent++;throw new InvalidOperationException();},CancellationToken.None,null,Task.Delay);}catch(InvalidOperationException){failed=true;}
+        Assert(failed && sent==1,"Input failure halts sequence");
+        RecordingBuffer recording=new RecordingBuffer();
+        MacroStep key=new MacroStep {Kind=StepKind.KeyDown,Key=Keys.LControlKey};
+        recording.Add(key,250); key.Key=Keys.A;
+        recording.Add(new MacroStep {Kind=StepKind.KeyUp,Key=Keys.LControlKey},400);
+        MacroStep[] recorded=recording.Snapshot();
+        Assert(recorded.Length==4 && recorded[0].Milliseconds==250 && recorded[2].Milliseconds==150,"Recorded timing between events");
+        Assert(recorded[1].Key==Keys.LControlKey && recorded[3].Kind==StepKind.KeyUp,"Recorded keys cloned and releases preserved");
+        string file=Path.Combine(Path.GetTempPath(),"region-macro-test-"+Guid.NewGuid().ToString("N")+".rcmacro");
+        try {
+            MacroStorage.Save(file,recorded,3); MacroFile loaded=MacroStorage.Load(file);
+            Assert(loaded.Repeats==3 && loaded.Steps.Length==4 && loaded.Steps[1].Key==Keys.LControlKey,"Macro save/load round trip");
+            MacroStorage.Save(file,armed,2); loaded=MacroStorage.Load(file);
+            Assert(loaded.Steps[2].Text=="한글 {a}+" && loaded.Steps[0].Button==2,"Overwrite preserves Unicode and middle click");
+            File.WriteAllText(file,"<!DOCTYPE x [<!ENTITY e SYSTEM 'file:///missing'>]><MacroFile>&e;</MacroFile>");
+            bool rejected=false; try{MacroStorage.Load(file);}catch(Exception){rejected=true;}
+            Assert(rejected,"External XML entities rejected");
+        } finally { if(File.Exists(file))File.Delete(file); }
+        bool invalid=false; try{MacroRunner.Snapshot(new []{new MacroStep {Kind=StepKind.MouseDown,Button=5}});}catch(ArgumentException){invalid=true;}
+        Assert(invalid,"Invalid recorded mouse button rejected");
+        long clock=0;
+        using(Bitmap a=new Bitmap(2,2))using(Bitmap b=new Bitmap(2,2))using(RepeatDetection repeat=new RepeatDetection(delegate{return clock;})) {
+            b.SetPixel(0,0,Color.White); repeat.Start(a,2,1000); repeat.Check(b,0,delegate{});
+            clock=5000;repeat.RestartCooldown();clock=5999;
+            Assert(repeat.RemainingMilliseconds==1 && !repeat.Check(a,0,delegate{}),"Cooldown restarts after long macro");
+            clock=6000; Assert(!repeat.Check(b,0,delegate{}) && !repeat.Waiting,"Post-macro rebase before next detection");
+        }
     }
     static void RepeatTests() {
         long time=0; int clicks=0;

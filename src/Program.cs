@@ -3,6 +3,8 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace RegionChangeClicker {
@@ -76,22 +78,25 @@ public sealed class RepeatDetection : IDisposable {
             });
         } catch { Dispose(); throw; }
     }
+    public void RestartCooldown() { if(Active && waiting)resumeAt=now()+cooldown; }
     public void Dispose() { Active=false; waiting=false; detector.Dispose(); }
 }
-static class Native {
+static partial class Native {
     [DllImport("user32.dll", SetLastError=true)] internal static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint key);
     [DllImport("user32.dll")] internal static extern bool UnregisterHotKey(IntPtr h, int id);
     [DllImport("user32.dll")] internal static extern bool SetCursorPos(int x,int y);
     [DllImport("user32.dll")] internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] internal static extern bool SetProcessDPIAware();
     [StructLayout(LayoutKind.Sequential)] internal struct MouseInput { public int dx,dy; public uint data,flags,time; public UIntPtr extra; }
-    [StructLayout(LayoutKind.Explicit)] internal struct Union { [FieldOffset(0)] public MouseInput mouse; }
+    [StructLayout(LayoutKind.Explicit)] internal struct Union { [FieldOffset(0)] public MouseInput mouse; [FieldOffset(0)] public KeyboardInput keyboard; }
     [StructLayout(LayoutKind.Sequential)] internal struct Input { public uint type; public Union u; }
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, Input[] inputs, int size);
-    internal static void Click(Point p) {
+    internal static void Click(Point p) { Click(p,0); }
+    internal static void Click(Point p,bool right) { Click(p,right?1:0); }
+    internal static void Click(Point p,int button) {
         if (!SetCursorPos(p.X,p.Y)) throw new InvalidOperationException("마우스를 이동할 수 없습니다.");
         Input[] inputs = new Input[2];
-        inputs[0].u.mouse.flags = 2; inputs[1].u.mouse.flags = 4;
+        inputs[0].u.mouse.flags=button==1?8u:button==2?32u:2u; inputs[1].u.mouse.flags=button==1?16u:button==2?64u:4u;
         uint sent = SendInput(2, inputs, Marshal.SizeOf(typeof(Input)));
         if (sent != 2) {
             if (sent == 1) SendInput(1, new Input[] { inputs[1] }, Marshal.SizeOf(typeof(Input)));
@@ -123,14 +128,22 @@ sealed class Selector : Form {
 }
 public sealed class Panel : Form {
     readonly RepeatDetection detector=new RepeatDetection();
-    readonly Timer timer=new Timer();
+    readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
+    readonly MacroEditor editor=new MacroEditor();
+    CheckBox linked;
+    Button testMacro;
+    MacroStep[] armedSteps;
+    int armedRepeats;
+    bool macroRunning;
+    CancellationTokenSource execution;
     Rectangle region; bool selecting, capturingKey, pending;
     Keys hotkey=Keys.F8; int hotkeyId=1;
     Label status, area, keyLabel;
     Button select, toggle, bind;
     NumericUpDown tolerance, interval, repetitions, cooldown;
     public Panel() {
-        Text="영역 변화 클릭 매크로"; ClientSize=new Size(500,505);
+        Text="영역 변화 클릭 · 매크로 편집/녹화"; ClientSize=new Size(1210,570);
+        AutoScroll=true;
         FormBorderStyle=FormBorderStyle.FixedSingle; MaximizeBox=false;
         StartPosition=FormStartPosition.CenterScreen; Font=new Font("맑은 고딕",10);
         BackColor=Color.FromArgb(246,248,252); KeyPreview=true;
@@ -151,12 +164,17 @@ public sealed class Panel : Form {
         Controls.Add(new Label { Text="쿨타임이 끝난 화면을 새 기준으로 다음 변화 감지",Bounds=new Rectangle(24,385,450,26) });
         toggle=ButtonAt("감지 시작",24,427,140); toggle.Click+=delegate { Toggle(); };
         status=new Label { Text="대기 중",Bounds=new Rectangle(180,427,290,65) }; Controls.Add(status);
+        linked=new CheckBox { Text="변화 위치 클릭 후 아래 매크로 실행",Bounds=new Rectangle(512,22,670,30) }; Controls.Add(linked);
+        editor.Location=new Point(500,65); Controls.Add(editor);
+        testMacro=ButtonAt("매크로만 테스트 (2초 후)",512,495,265); testMacro.Click+=delegate { TestMacro(); };
+        Controls.Add(new Label { Text="중단: 왼쪽 정지 버튼 / ON·OFF 단축키\n녹화 종료: F9 · 녹화는 최대 10분/2000개 동작",Bounds=new Rectangle(800,495,380,60) });
+        ClientSize=new Size(Math.Min(1210,Screen.PrimaryScreen.WorkingArea.Width-80),Math.Min(570,Screen.PrimaryScreen.WorkingArea.Height-100));
         timer.Interval=300; timer.Tick+=delegate { Tick(); };
         Shown+=delegate { if(!Native.RegisterHotKey(Handle,hotkeyId,0x4000, (uint)Keys.F8)) { hotkey=Keys.None; status.Text="F8 사용 중: 단축키를 변경하세요."; } UpdateKey(); };
         KeyDown+=OnKey;
-        FormClosing+=delegate { timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
-        Resize+=delegate { if(detector.Active || pending) Stop("창 상태 변경으로 정지했습니다."); };
-        LocationChanged+=delegate { if(detector.Active || pending) Stop("창 이동으로 정지했습니다."); };
+        FormClosing+=delegate { if(execution!=null)execution.Cancel(); Native.ReleaseHeld(); timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
+        Resize+=delegate { if(detector.Active || pending || macroRunning) Stop("창 상태 변경으로 정지했습니다."); };
+        LocationChanged+=delegate { if(detector.Active || pending || macroRunning) Stop("창 이동으로 정지했습니다."); };
     }
     Button ButtonAt(string text,int x,int y,int w) { Button b=new Button { Text=text,Bounds=new Rectangle(x,y,w,36) }; Controls.Add(b); return b; }
     void UpdateKey() { keyLabel.Text="ON / OFF 단축키: "+(hotkey==Keys.None?"미설정":new KeysConverter().ConvertToString(hotkey)); }
@@ -171,7 +189,7 @@ public sealed class Panel : Form {
         if(!Native.RegisterHotKey(Handle,newId,mods,(uint)e.KeyCode)) { status.Text="이미 사용 중인 단축키입니다. 다시 입력하세요."; return; }
         Native.UnregisterHotKey(Handle,hotkeyId); hotkeyId=newId; hotkey=candidate; capturingKey=false; UpdateKey(); status.Text="단축키 적용 완료";
     }
-    protected override void WndProc(ref Message m) { if(m.Msg==0x312 && m.WParam.ToInt32()==hotkeyId && !capturingKey && !selecting) Toggle(); base.WndProc(ref m); }
+    protected override void WndProc(ref Message m) { if(m.Msg==0x312 && m.WParam.ToInt32()==hotkeyId && !capturingKey && !selecting && !editor.Picking) Toggle(); base.WndProc(ref m); }
     void Choose() {
         Stop("영역 선택 중"); selecting=true; Hide();
         try { using(Selector s=new Selector()) if(s.ShowDialog()==DialogResult.OK) { region=s.Selected; area.Text=string.Format("X {0}  Y {1}  /  {2} × {3} px",region.X,region.Y,region.Width,region.Height); } }
@@ -190,16 +208,63 @@ public sealed class Panel : Form {
         }
     }
     void Toggle() {
-        if(pending || detector.Active) { Stop("사용자가 정지했습니다."); return; }
-        if(selecting || capturingKey)return;
+        if(pending || detector.Active || macroRunning) { Stop("사용자가 정지했습니다."); return; }
+        if(selecting || capturingKey || editor.Picking)return;
         if(!RegionValid()) { status.Text="유효한 화면 영역을 선택하세요."; return; }
         if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { status.Text="컨트롤 패널을 감지 영역 밖으로 옮기세요."; return; }
+        try { armedSteps=linked.Checked?ValidateMacro():new MacroStep[0]; armedRepeats=editor.Repeats; }
+        catch(ArgumentException ex) { status.Text=ex.Message; return; }
         timer.Interval=decimal.ToInt32(interval.Value*1000m);
         pending=true; Editing(false); toggle.Text="감지 정지";
         status.Text="기준 화면 준비 중…"; timer.Start();
     }
-    void Editing(bool enabled) { select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=repetitions.Enabled=cooldown.Enabled=enabled; }
-    void Stop(string text) { timer.Stop(); pending=false; detector.Dispose(); Editing(true); toggle.Text="감지 시작"; status.Text=text; }
+    void Editing(bool enabled) { select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=repetitions.Enabled=cooldown.Enabled=editor.Enabled=linked.Enabled=testMacro.Enabled=enabled; }
+    void Stop(string text) {
+        timer.Stop(); pending=false; detector.Dispose();
+        if(execution!=null)execution.Cancel();
+        if(macroRunning) { status.Text=text+" · 중단 중"; toggle.Enabled=false; return; }
+        Editing(true); toggle.Enabled=true; toggle.Text="감지 시작"; status.Text=text;
+    }
+    MacroStep[] ValidateMacro() {
+        MacroStep[] steps=editor.Snapshot();
+        foreach(MacroStep step in steps) if((step.Kind==StepKind.Key || step.Kind==StepKind.KeyDown || step.Kind==StepKind.KeyUp) && (step.Key&Keys.KeyCode)==(hotkey&Keys.KeyCode))
+            throw new ArgumentException("매크로 키와 감지 ON/OFF 단축키를 다르게 설정하세요.");
+        return steps;
+    }
+    void TestMacro() {
+        if(macroRunning || pending || detector.Active || capturingKey || editor.Picking)return;
+        try {
+            armedSteps=ValidateMacro(); armedRepeats=editor.Repeats;
+            foreach(MacroStep step in armedSteps) if(step.Kind==StepKind.DetectedClick)throw new ArgumentException("변화 위치 클릭 동작은 실제 감지 후에만 사용할 수 있습니다.");
+            RunMacro(Point.Empty,true);
+        } catch(ArgumentException ex) { status.Text=ex.Message; }
+    }
+    async void RunMacro(Point target,bool manual) {
+        timer.Stop(); macroRunning=true; Editing(false); toggle.Text="매크로 정지";
+        CancellationTokenSource current=new CancellationTokenSource(); execution=current;
+        string failure=null;
+        try {
+            if(manual) { status.Text="2초 후 테스트 · 입력할 창을 선택하세요."; await Task.Delay(2000,current.Token); }
+            for(int pass=0;pass<armedRepeats;pass++) {
+                int iteration=pass;
+                try { await MacroRunner.RunAsync(armedSteps,target,Native.Execute,current.Token,
+                    delegate(int i) { status.Text=string.Format("매크로 {0}/{1}회 · {2}/{3}단계",iteration+1,armedRepeats,i+1,armedSteps.Length); },
+                    delegate(int ms,CancellationToken token) { return Task.Delay(ms,token); }); }
+                finally { Native.ReleaseHeld(); }
+            }
+        } catch(OperationCanceledException) { failure="매크로 정지 · 남은 동작 취소"; }
+        catch(Exception ex) { failure="매크로 오류: "+ex.Message; }
+        finally {
+            Native.ReleaseHeld(); execution=null; current.Dispose(); macroRunning=false;
+            if(!IsDisposed && !Disposing) {
+                toggle.Enabled=true;
+                if(failure!=null)Stop(failure);
+                else if(manual)Stop("매크로 테스트 완료");
+                else if(!detector.Active)Stop(string.Format("{0}회 감지/클릭 및 매크로 완료",detector.Completed));
+                else { detector.RestartCooldown(); toggle.Text="감지 정지"; DetectionStatus(); timer.Start(); }
+            }
+        }
+    }
     void DetectionStatus() {
         string progress=string.Format("{0}/{1}회",detector.Completed,(int)repetitions.Value);
         status.Text=detector.Waiting ? string.Format("{0} · 쿨타임 {1:0.00}초",progress,detector.RemainingMilliseconds/1000m)
@@ -211,11 +276,13 @@ public sealed class Panel : Form {
             if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { Stop("패널이 감지 영역에 겹쳐 정지했습니다."); return; }
             using(Bitmap image=CaptureRegion()) {
                 if(pending) { detector.Start(image,(int)repetitions.Value,decimal.ToInt32(cooldown.Value*1000m)); pending=false; DetectionStatus(); return; }
-                detector.Check(image,(int)tolerance.Value,delegate(Point local) {
-                    Point target=new Point(region.X+local.X,region.Y+local.Y);
+                Point target=Point.Empty;
+                bool clicked=detector.Check(image,(int)tolerance.Value,delegate(Point local) {
+                    target=new Point(region.X+local.X,region.Y+local.Y);
                     Native.Click(target);
                 });
-                if(!detector.Active)Stop(string.Format("{0}회 클릭 완료 · 자동 정지",detector.Completed));
+                if(clicked && armedSteps.Length>0)RunMacro(target,false);
+                else if(!detector.Active)Stop(string.Format("{0}회 클릭 완료 · 자동 정지",detector.Completed));
                 else DetectionStatus();
             }
         } catch(Exception ex) { Stop("오류로 정지: "+ex.Message); }
