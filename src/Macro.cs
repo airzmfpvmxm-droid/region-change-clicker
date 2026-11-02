@@ -127,6 +127,18 @@ public static class MouseScope {
         return result.ToArray();
     }
 }
+public static class MouseMovement {
+    // Select the middle of the pixel's normalized coordinate range, avoiding edge rounding.
+    public static Point Normalize(Point point,Rectangle desktop) {
+        if(desktop.Width<1 || desktop.Height<1 || !desktop.Contains(point))throw new ArgumentException("마우스 좌표가 가상 화면 밖입니다.");
+        return new Point((int)Math.Min(65535,(((long)point.X-desktop.Left)*65536+32768)/desktop.Width),
+            (int)Math.Min(65535,(((long)point.Y-desktop.Top)*65536+32768)/desktop.Height));
+    }
+    public static bool TryMove(Point target,Func<Point,bool> direct,Func<Point,bool> absolute,Func<Point,bool> confirm) {
+        if(direct(target) && confirm(target))return true;
+        return absolute(target) && confirm(target);
+    }
+}
 static partial class Native {
     static readonly HashSet<Keys> heldKeys=new HashSet<Keys>();
     static readonly HashSet<int> heldButtons=new HashSet<int>();
@@ -186,7 +198,26 @@ static partial class Native {
     }
     static void Move(Point p) {
         bool visible=false; foreach(Screen screen in Screen.AllScreens)if(screen.Bounds.Contains(p))visible=true;
-        if(!visible || !SetCursorPos(p.X,p.Y))throw new InvalidOperationException("마우스 좌표가 현재 화면 밖입니다.");
+        if(!visible)throw new InvalidOperationException("마우스 좌표가 현재 화면 밖입니다.");
+        int directError=0,absoluteError=0;
+        bool moved=MouseMovement.TryMove(p,
+            delegate(Point target) { bool ok=SetCursorPos(target.X,target.Y); if(!ok)directError=Marshal.GetLastWin32Error(); return ok; },
+            delegate(Point target) {
+                Point normalized=MouseMovement.Normalize(target,SystemInformation.VirtualScreen);
+                Input input=new Input(); input.u.mouse.dx=normalized.X; input.u.mouse.dy=normalized.Y;
+                input.u.mouse.flags=0x8000|0x4000|0x0001; // ABSOLUTE | VIRTUALDESK | MOVE
+                bool ok=SendInput(1,new Input[]{input},Marshal.SizeOf(typeof(Input)))==1;
+                if(!ok)absoluteError=Marshal.GetLastWin32Error(); return ok;
+            },ConfirmCursor);
+        if(!moved)throw new InvalidOperationException(string.Format("마우스 이동 차단 (위치:{0}, 입력:{1}). 권한/바탕화면 상태를 확인하세요.",directError,absoluteError));
+    }
+    static bool ConfirmCursor(Point target) {
+        for(int attempt=0;attempt<6;attempt++) {
+            Point actual;
+            if(GetCursorPos(out actual) && actual==target)return true;
+            if(attempt<5)Thread.Sleep(10);
+        }
+        return false;
     }
     static void SendOne(Input input) {
         if(SendInput(1,new Input[] { input },Marshal.SizeOf(typeof(Input)))!=1)throw new InvalidOperationException("입력 전송 실패. 대상 권한을 확인하세요.");
@@ -206,7 +237,10 @@ static partial class Native {
         }
         if(heldButtons.Count>0 && area.HasValue) {
             Rectangle allowed=area.Value; Point current=Cursor.Position;
-            if(!allowed.Contains(current))SetCursorPos(Math.Max(allowed.Left,Math.Min(allowed.Right-1,current.X)),Math.Max(allowed.Top,Math.Min(allowed.Bottom-1,current.Y)));
+            if(!allowed.Contains(current)) {
+                try { Move(new Point(Math.Max(allowed.Left,Math.Min(allowed.Right-1,current.X)),Math.Max(allowed.Top,Math.Min(allowed.Bottom-1,current.Y)))); }
+                catch(InvalidOperationException) { /* Always release held buttons even if Windows blocks relocation. */ }
+            }
         }
         foreach(int button in new List<int>(heldButtons)) {
             Input input=new Input(); input.u.mouse.flags=button==1?16u:button==2?64u:4u; SendInput(1,new Input[] {input},Marshal.SizeOf(typeof(Input)));

@@ -84,7 +84,8 @@ public sealed class RepeatDetection : IDisposable {
 static partial class Native {
     [DllImport("user32.dll", SetLastError=true)] internal static extern bool RegisterHotKey(IntPtr h, int id, uint mods, uint key);
     [DllImport("user32.dll")] internal static extern bool UnregisterHotKey(IntPtr h, int id);
-    [DllImport("user32.dll")] internal static extern bool SetCursorPos(int x,int y);
+    [DllImport("user32.dll",SetLastError=true)] internal static extern bool SetCursorPos(int x,int y);
+    [DllImport("user32.dll",SetLastError=true)] static extern bool GetCursorPos(out Point point);
     [DllImport("user32.dll")] internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] internal static extern bool SetProcessDPIAware();
     [StructLayout(LayoutKind.Sequential)] internal struct MouseInput { public int dx,dy; public uint data,flags,time; public UIntPtr extra; }
@@ -94,13 +95,14 @@ static partial class Native {
     internal static void Click(Point p) { Click(p,0); }
     internal static void Click(Point p,bool right) { Click(p,right?1:0); }
     internal static void Click(Point p,int button) {
-        if (!SetCursorPos(p.X,p.Y)) throw new InvalidOperationException("마우스를 이동할 수 없습니다.");
+        Move(p);
         Input[] inputs = new Input[2];
         inputs[0].u.mouse.flags=button==1?8u:button==2?32u:2u; inputs[1].u.mouse.flags=button==1?16u:button==2?64u:4u;
         uint sent = SendInput(2, inputs, Marshal.SizeOf(typeof(Input)));
         if (sent != 2) {
+            int error=Marshal.GetLastWin32Error();
             if (sent == 1) SendInput(1, new Input[] { inputs[1] }, Marshal.SizeOf(typeof(Input)));
-            throw new InvalidOperationException("클릭 전송 실패. 대상 프로그램의 권한을 확인하세요.");
+            throw new InvalidOperationException("클릭 전송 차단 (오류 "+error+"). 대상과 같은 권한인지 확인하세요.");
         }
     }
 }

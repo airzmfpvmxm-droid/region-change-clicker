@@ -40,7 +40,37 @@ class Tests {
         SynchronizationContext.SetSynchronizationContext(null);
         MacroTests().GetAwaiter().GetResult();
         ScopeTests();
+        MovementTests();
         Console.WriteLine("PASS: "+checks+" assertions (no real mouse input)");
+    }
+    static void MovementTests() {
+        Rectangle desktop=new Rectangle(-1920,-1080,5760,2160); bool exact=true;
+        for(int x=desktop.Left;x<desktop.Right;x++) {
+            Point normalized=MouseMovement.Normalize(new Point(x,desktop.Top),desktop);
+            if(desktop.Left+(long)normalized.X*desktop.Width/65536!=x)exact=false;
+        }
+        for(int y=desktop.Top;y<desktop.Bottom;y++) {
+            Point normalized=MouseMovement.Normalize(new Point(desktop.Right-1,y),desktop);
+            if(desktop.Top+(long)normalized.Y*desktop.Height/65536!=y)exact=false;
+        }
+        Assert(exact,"Absolute normalization maps every virtual desktop pixel exactly");
+        bool outside=false;try{MouseMovement.Normalize(new Point(desktop.Right,0),desktop);}catch(ArgumentException){outside=true;}
+        Assert(outside,"Absolute movement rejects outside coordinates");
+        int fallback=0,confirmed=0;
+        bool moved=MouseMovement.TryMove(new Point(1,2),delegate{return false;},delegate{fallback++;return true;},delegate{confirmed++;return true;});
+        Assert(moved && fallback==1 && confirmed==1,"Failed SetCursorPos uses confirmed fallback");
+        fallback=0;
+        moved=MouseMovement.TryMove(Point.Empty,delegate{return true;},delegate{fallback++;return true;},delegate{return true;});
+        Assert(moved && fallback==0,"Successful direct move skips fallback");
+        confirmed=0;
+        moved=MouseMovement.TryMove(Point.Empty,delegate{return false;},delegate{return false;},delegate{confirmed++;return true;});
+        Assert(!moved && confirmed==0,"Blocked movement never reports success");
+        confirmed=0;fallback=0;
+        moved=MouseMovement.TryMove(Point.Empty,delegate{return true;},delegate{fallback++;return true;},delegate{confirmed++;return confirmed==2;});
+        Assert(moved && fallback==1 && confirmed==2,"Direct move landing elsewhere uses verified fallback");
+        moved=MouseMovement.TryMove(Point.Empty,delegate{return true;},delegate{return true;},delegate{return false;});
+        Assert(!moved,"No click allowed if cursor never reaches destination");
+        Assert(System.Runtime.InteropServices.Marshal.SizeOf(typeof(Native.Input))==(IntPtr.Size==8?40:28),"SendInput native structure size matches platform");
     }
     static void ScopeTests() {
         Rectangle area=new Rectangle(-100,20,200,100);
