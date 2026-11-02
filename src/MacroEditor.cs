@@ -24,6 +24,7 @@ public sealed class MacroEditor : UserControl {
     Button pick;
     Keys chord=Keys.Enter;
     public bool Picking { get; private set; }
+    public Func<Rectangle?> RecordingArea;
     public int Repeats { get { return (int)repeats.Value; } }
     public MacroEditor() {
         Size=new Size(696,410);
@@ -104,8 +105,11 @@ public sealed class MacroEditor : UserControl {
     }
     void Replace(MacroStep[] steps) { list.Items.Clear(); foreach(MacroStep step in steps)list.Items.Add(step); if(list.Items.Count>0)list.SelectedIndex=0; }
     void Record() {
+        Rectangle? allowed=null;
+        try { if(RecordingArea!=null)allowed=RecordingArea(); }
+        catch(ArgumentException ex) { MessageBox.Show(this,ex.Message,"녹화 영역"); return; }
         Form owner=FindForm(); Picking=true; owner.Hide();
-        try { using(RecorderDialog dialog=new RecorderDialog()) if(dialog.ShowDialog()==DialogResult.OK)Replace(dialog.Result); }
+        try { using(RecorderDialog dialog=new RecorderDialog(allowed)) if(dialog.ShowDialog()==DialogResult.OK)Replace(dialog.Result); }
         finally { owner.Show(); owner.Activate(); Picking=false; }
     }
     void SaveFile() {

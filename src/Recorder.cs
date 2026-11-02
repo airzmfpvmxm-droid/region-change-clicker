@@ -35,11 +35,14 @@ sealed class RecorderDialog : Form {
     readonly Stopwatch clock=new Stopwatch();
     readonly System.Windows.Forms.Timer update=new System.Windows.Forms.Timer();
     readonly Hook keyCallback,mouseCallback;
+    readonly Rectangle? recordingArea;
+    readonly HashSet<int> recordedButtons=new HashSet<int>();
     IntPtr keyHook,mouseHook;
     long lastMove=-50;
     bool recording, ending;
     public MacroStep[] Result;
-    public RecorderDialog() {
+    public RecorderDialog(Rectangle? area=null) {
+        recordingArea=area;
         Text="매크로 녹화"; ClientSize=new Size(430,165); Font=new Font("맑은 고딕",10);
         FormBorderStyle=FormBorderStyle.FixedDialog; MaximizeBox=MinimizeBox=false; TopMost=true; StartPosition=FormStartPosition.CenterScreen;
         info.Bounds=new Rectangle(18,15,395,75); info.Text="2초 후 녹화를 시작합니다.\n조작을 마치면 F9 또는 녹화 완료를 누르세요."; Controls.Add(info);
@@ -83,7 +86,7 @@ sealed class RecorderDialog : Form {
                     if(msg==0x100 || msg==0x104)BeginInvoke(new Action(delegate { Finish(true); }));
                     return new IntPtr(1);
                 }
-                if((k.flags&0x10)==0 && GetForegroundWindow()!=Handle) {
+                if(!recordingArea.HasValue && (k.flags&0x10)==0 && GetForegroundWindow()!=Handle) {
                     if(msg==0x100 || msg==0x104)Add(new MacroStep { Kind=StepKind.KeyDown,Key=(Keys)k.key });
                     else if(msg==0x101 || msg==0x105)Add(new MacroStep { Kind=StepKind.KeyUp,Key=(Keys)k.key });
                 }
@@ -95,6 +98,14 @@ sealed class RecorderDialog : Form {
         if(code>=0 && recording) {
             try {
                 MouseData m=(MouseData)Marshal.PtrToStructure(data,typeof(MouseData));
+                if(recordingArea.HasValue && !recordingArea.Value.Contains(m.point)) {
+                    if((m.flags&1)==0 && recordedButtons.Count>0) {
+                        Rectangle a=recordingArea.Value;
+                        foreach(int button in new List<int>(recordedButtons))Add(new MacroStep {Kind=StepKind.MouseUp,Button=button,X=Math.Max(a.Left,Math.Min(a.Right-1,m.point.X)),Y=Math.Max(a.Top,Math.Min(a.Bottom-1,m.point.Y))});
+                        recordedButtons.Clear();
+                    }
+                    return CallNextHookEx(mouseHook,code,message,data);
+                }
                 if((m.flags&1)==0 && !Bounds.Contains(m.point)) {
                     int msg=message.ToInt32(); MacroStep step=new MacroStep { X=m.point.X,Y=m.point.Y };
                     if(msg==0x200) { if(clock.ElapsedMilliseconds-lastMove<50)return CallNextHookEx(mouseHook,code,message,data); lastMove=clock.ElapsedMilliseconds; step.Kind=StepKind.MouseMove; }
@@ -103,6 +114,8 @@ sealed class RecorderDialog : Form {
                     else if(msg==0x202 || msg==0x205 || msg==0x208) { step.Kind=StepKind.MouseUp; step.Button=msg==0x205?1:msg==0x208?2:0; }
                     else return CallNextHookEx(mouseHook,code,message,data);
                     Add(step);
+                    if(step.Kind==StepKind.MouseDown)recordedButtons.Add(step.Button);
+                    if(step.Kind==StepKind.MouseUp)recordedButtons.Remove(step.Button);
                 }
             } catch { if(!ending)BeginInvoke(new Action(delegate { Finish(false); })); }
         }

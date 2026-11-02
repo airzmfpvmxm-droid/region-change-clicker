@@ -39,7 +39,28 @@ class Tests {
         }
         SynchronizationContext.SetSynchronizationContext(null);
         MacroTests().GetAwaiter().GetResult();
+        ScopeTests();
         Console.WriteLine("PASS: "+checks+" assertions (no real mouse input)");
+    }
+    static void ScopeTests() {
+        Rectangle area=new Rectangle(-100,20,200,100);
+        MacroStep[] mixed={new MacroStep {Kind=StepKind.Key,Key=Keys.A},new MacroStep {Kind=StepKind.Text,Text="skip"},new MacroStep {Kind=StepKind.KeyDown,Key=Keys.ControlKey},new MacroStep {Kind=StepKind.Delay,Milliseconds=100},new MacroStep {Kind=StepKind.PositionClick,X=-100,Y=20},new MacroStep {Kind=StepKind.MouseMove,X=99,Y=119},new MacroStep {Kind=StepKind.MouseWheel,X=0,Y=50},new MacroStep {Kind=StepKind.MouseDown,X=0,Y=50},new MacroStep {Kind=StepKind.MouseUp,X=99,Y=119}};
+        MacroStep[] filtered=MouseScope.Prepare(mixed,area);
+        Assert(filtered.Length==6 && filtered[0].Kind==StepKind.Delay,"Mouse mode removes all keyboard events but keeps timing");
+        foreach(MacroStep step in filtered)MouseScope.RequireStep(area,step,Point.Empty);
+        Assert(filtered[1].X==-100 && filtered[2].X==99,"Negative coordinates and interior boundaries accepted");
+        foreach(StepKind kind in new[]{StepKind.PositionClick,StepKind.MouseMove,StepKind.MouseWheel,StepKind.MouseDown,StepKind.MouseUp}) {
+            bool rejected=false; try {MouseScope.Prepare(new[]{new MacroStep {Kind=kind,X=100,Y=50}},area);}catch(ArgumentException){rejected=true;}
+            Assert(rejected,"Outside fixed mouse action rejected: "+kind);
+        }
+        bool outside=false;try{MouseScope.RequireStep(area,new MacroStep{Kind=StepKind.DetectedClick},new Point(0,120));}catch(ArgumentException){outside=true;}
+        Assert(outside,"Detected click outside bottom boundary blocked");
+        bool keyboard=false;try{MouseScope.RequireStep(area,new MacroStep{Kind=StepKind.Key,Key=Keys.Enter},Point.Empty);}catch(ArgumentException){keyboard=true;}
+        Assert(keyboard,"Runtime guard blocks keyboard bypass");
+        bool empty=false;try{MouseScope.Prepare(new[]{new MacroStep{Kind=StepKind.Text,Text="no mouse"}},area);}catch(ArgumentException){empty=true;}
+        Assert(empty,"Keyboard-only macro rejected in mouse mode");
+        MouseScope.RequireStep(area,new MacroStep{Kind=StepKind.DetectedClick},new Point(-100,20));
+        Assert(true,"Inside detected click allowed");
     }
     static async Task MacroTests() {
         MacroStep[] source={ new MacroStep { Kind=StepKind.PositionClick,X=-20,Y=30,Button=2 },new MacroStep {Kind=StepKind.Delay,Milliseconds=500},new MacroStep {Kind=StepKind.Text,Text="한글 {a}+"},new MacroStep {Kind=StepKind.Key,Key=Keys.Control|Keys.A} };

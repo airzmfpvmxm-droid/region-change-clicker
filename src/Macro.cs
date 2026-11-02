@@ -100,6 +100,33 @@ public static class MacroRunner {
         token.ThrowIfCancellationRequested();
     }
 }
+public static class MouseScope {
+    public static bool IsMouse(StepKind kind) {
+        return kind==StepKind.DetectedClick || kind==StepKind.PositionClick || kind==StepKind.MouseMove || kind==StepKind.MouseWheel || kind==StepKind.MouseDown || kind==StepKind.MouseUp;
+    }
+    public static void RequirePoint(Rectangle area,Point point) {
+        if(area.Width<2 || area.Height<2 || !area.Contains(point))throw new ArgumentException("마우스 동작 좌표가 지정한 작동 영역 밖입니다.");
+    }
+    public static void RequireStep(Rectangle area,MacroStep step,Point detected) {
+        if(step.Kind==StepKind.Delay)return;
+        if(!IsMouse(step.Kind))throw new ArgumentException("마우스 영역 제한 모드에서는 키보드 입력을 실행하지 않습니다.");
+        RequirePoint(area,step.Kind==StepKind.DetectedClick?detected:new Point(step.X,step.Y));
+    }
+    public static MacroStep[] Prepare(IEnumerable<MacroStep> source,Rectangle area) {
+        if(area.Width<2 || area.Height<2)throw new ArgumentException("마우스 작동 영역을 먼저 지정하세요.");
+        List<MacroStep> result=new List<MacroStep>(); bool hasMouse=false;
+        foreach(MacroStep step in MacroRunner.Snapshot(source)) {
+            if(step.Kind!=StepKind.Delay && !IsMouse(step.Kind))continue;
+            if(IsMouse(step.Kind)) {
+                hasMouse=true;
+                if(step.Kind!=StepKind.DetectedClick)RequirePoint(area,new Point(step.X,step.Y));
+            }
+            result.Add(step);
+        }
+        if(!hasMouse)throw new ArgumentException("제한 영역 안에서 실행할 마우스 동작을 1개 이상 추가하세요.");
+        return result.ToArray();
+    }
+}
 static partial class Native {
     static readonly HashSet<Keys> heldKeys=new HashSet<Keys>();
     static readonly HashSet<int> heldButtons=new HashSet<int>();
@@ -172,9 +199,14 @@ static partial class Native {
         Move(p); Input input=new Input(); input.u.mouse.flags=button==1?(up?16u:8u):button==2?(up?64u:32u):(up?4u:2u);
         SendOne(input); if(up)heldButtons.Remove(button); else heldButtons.Add(button);
     }
-    internal static void ReleaseHeld() {
+    internal static void ReleaseHeld() { ReleaseHeld(null); }
+    internal static void ReleaseHeld(Rectangle? area) {
         foreach(Keys key in new List<Keys>(heldKeys)) {
             Input input=KeyInput((ushort)key,0,2u|(Extended(key)?1u:0u)); SendInput(1,new Input[] {input},Marshal.SizeOf(typeof(Input)));
+        }
+        if(heldButtons.Count>0 && area.HasValue) {
+            Rectangle allowed=area.Value; Point current=Cursor.Position;
+            if(!allowed.Contains(current))SetCursorPos(Math.Max(allowed.Left,Math.Min(allowed.Right-1,current.X)),Math.Max(allowed.Top,Math.Min(allowed.Bottom-1,current.Y)));
         }
         foreach(int button in new List<int>(heldButtons)) {
             Input input=new Input(); input.u.mouse.flags=button==1?16u:button==2?64u:4u; SendInput(1,new Input[] {input},Marshal.SizeOf(typeof(Input)));

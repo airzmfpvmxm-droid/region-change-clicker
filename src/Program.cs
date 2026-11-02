@@ -130,8 +130,11 @@ public sealed class Panel : Form {
     readonly RepeatDetection detector=new RepeatDetection();
     readonly System.Windows.Forms.Timer timer=new System.Windows.Forms.Timer();
     readonly MacroEditor editor=new MacroEditor();
-    CheckBox linked;
-    Button testMacro;
+    CheckBox linked, restrictMouse;
+    Button testMacro, chooseMouseArea;
+    Label mouseAreaLabel;
+    Rectangle mouseArea, armedMouseArea;
+    bool armedMouseOnly;
     MacroStep[] armedSteps;
     int armedRepeats;
     bool macroRunning;
@@ -142,7 +145,7 @@ public sealed class Panel : Form {
     Button select, toggle, bind;
     NumericUpDown tolerance, interval, repetitions, cooldown;
     public Panel() {
-        Text="영역 변화 클릭 · 매크로 편집/녹화"; ClientSize=new Size(1210,570);
+        Text="영역 변화 클릭 · 매크로 편집/녹화"; ClientSize=new Size(1210,630);
         AutoScroll=true;
         FormBorderStyle=FormBorderStyle.FixedSingle; MaximizeBox=false;
         StartPosition=FormStartPosition.CenterScreen; Font=new Font("맑은 고딕",10);
@@ -162,17 +165,25 @@ public sealed class Panel : Form {
         Controls.Add(new Label { Text="클릭 후 쿨타임 (초 · 0~600)",Bounds=new Rectangle(24,348,325,26) });
         cooldown=new NumericUpDown { Minimum=0,Maximum=600,DecimalPlaces=2,Increment=0.1m,Value=1m,Bounds=new Rectangle(365,345,105,28) }; Controls.Add(cooldown);
         Controls.Add(new Label { Text="쿨타임이 끝난 화면을 새 기준으로 다음 변화 감지",Bounds=new Rectangle(24,385,450,26) });
-        toggle=ButtonAt("감지 시작",24,427,140); toggle.Click+=delegate { Toggle(); };
-        status=new Label { Text="대기 중",Bounds=new Rectangle(180,427,290,65) }; Controls.Add(status);
+        restrictMouse=new CheckBox { Text="마우스 작동 영역 제한 (키보드/문자 입력 제외)",Checked=true,Bounds=new Rectangle(24,425,450,28) }; Controls.Add(restrictMouse);
+        chooseMouseArea=ButtonAt("작동 영역 지정",24,465,140); chooseMouseArea.Click+=delegate { ChooseMouseArea(); };
+        mouseAreaLabel=new Label { Text="작동 영역 미지정\n감지 영역도 작동 영역 안에 지정하세요.",Bounds=new Rectangle(180,465,290,60) }; Controls.Add(mouseAreaLabel);
+        toggle=ButtonAt("감지 시작",24,545,140); toggle.Click+=delegate { Toggle(); };
+        status=new Label { Text="대기 중",Bounds=new Rectangle(180,545,290,65) }; Controls.Add(status);
         linked=new CheckBox { Text="변화 위치 클릭 후 아래 매크로 실행",Bounds=new Rectangle(512,22,670,30) }; Controls.Add(linked);
         editor.Location=new Point(500,65); Controls.Add(editor);
+        editor.RecordingArea=delegate {
+            if(!restrictMouse.Checked)return (Rectangle?)null;
+            if(!RegionValid(mouseArea))throw new ArgumentException("녹화 전에 마우스 작동 영역을 지정하세요.");
+            return (Rectangle?)mouseArea;
+        };
         testMacro=ButtonAt("매크로만 테스트 (2초 후)",512,495,265); testMacro.Click+=delegate { TestMacro(); };
         Controls.Add(new Label { Text="중단: 왼쪽 정지 버튼 / ON·OFF 단축키\n녹화 종료: F9 · 녹화는 최대 10분/2000개 동작",Bounds=new Rectangle(800,495,380,60) });
-        ClientSize=new Size(Math.Min(1210,Screen.PrimaryScreen.WorkingArea.Width-80),Math.Min(570,Screen.PrimaryScreen.WorkingArea.Height-100));
+        ClientSize=new Size(Math.Min(1210,Screen.PrimaryScreen.WorkingArea.Width-80),Math.Min(630,Screen.PrimaryScreen.WorkingArea.Height-100));
         timer.Interval=300; timer.Tick+=delegate { Tick(); };
         Shown+=delegate { if(!Native.RegisterHotKey(Handle,hotkeyId,0x4000, (uint)Keys.F8)) { hotkey=Keys.None; status.Text="F8 사용 중: 단축키를 변경하세요."; } UpdateKey(); };
         KeyDown+=OnKey;
-        FormClosing+=delegate { if(execution!=null)execution.Cancel(); Native.ReleaseHeld(); timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
+        FormClosing+=delegate { if(execution!=null)execution.Cancel(); ReleaseMacroInput(); timer.Stop(); detector.Dispose(); Native.UnregisterHotKey(Handle,hotkeyId); timer.Dispose(); };
         Resize+=delegate { if(detector.Active || pending || macroRunning) Stop("창 상태 변경으로 정지했습니다."); };
         LocationChanged+=delegate { if(detector.Active || pending || macroRunning) Stop("창 이동으로 정지했습니다."); };
     }
@@ -195,14 +206,22 @@ public sealed class Panel : Form {
         try { using(Selector s=new Selector()) if(s.ShowDialog()==DialogResult.OK) { region=s.Selected; area.Text=string.Format("X {0}  Y {1}  /  {2} × {3} px",region.X,region.Y,region.Width,region.Height); } }
         finally { selecting=false; Show(); Activate(); status.Text="대기 중"; }
     }
+    void ChooseMouseArea() {
+        Stop("마우스 작동 영역 선택 중"); selecting=true; Hide();
+        try { using(Selector selector=new Selector()) if(selector.ShowDialog()==DialogResult.OK) {
+            mouseArea=selector.Selected;
+            mouseAreaLabel.Text=string.Format("X {0}  Y {1}\n{2} × {3} px",mouseArea.X,mouseArea.Y,mouseArea.Width,mouseArea.Height);
+        } } finally { selecting=false; Show(); Activate(); status.Text="대기 중"; }
+    }
     Bitmap CaptureRegion() {
         Bitmap b=new Bitmap(region.Width,region.Height,PixelFormat.Format32bppArgb);
         try { using(Graphics g=Graphics.FromImage(b)) g.CopyFromScreen(region.Location,Point.Empty,region.Size,CopyPixelOperation.SourceCopy); return b; }
         catch { b.Dispose(); throw; }
     }
-    bool RegionValid() {
-        if(region.Width<2 || region.Height<2)return false;
-        using(Region remaining=new Region(region)) {
+    bool RegionValid() { return RegionValid(region); }
+    bool RegionValid(Rectangle target) {
+        if(target.Width<2 || target.Height<2)return false;
+        using(Region remaining=new Region(target)) {
             foreach(Screen screen in Screen.AllScreens)remaining.Exclude(screen.Bounds);
             using(Graphics g=CreateGraphics())return remaining.IsEmpty(g);
         }
@@ -212,13 +231,17 @@ public sealed class Panel : Form {
         if(selecting || capturingKey || editor.Picking)return;
         if(!RegionValid()) { status.Text="유효한 화면 영역을 선택하세요."; return; }
         if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { status.Text="컨트롤 패널을 감지 영역 밖으로 옮기세요."; return; }
-        try { armedSteps=linked.Checked?ValidateMacro():new MacroStep[0]; armedRepeats=editor.Repeats; }
+        try {
+            ArmMouseScope();
+            if(armedMouseOnly && !armedMouseArea.Contains(region))throw new ArgumentException("감지 영역 전체를 마우스 작동 영역 안에 지정하세요.");
+            armedSteps=linked.Checked?ValidateMacro():new MacroStep[0]; armedRepeats=editor.Repeats;
+        }
         catch(ArgumentException ex) { status.Text=ex.Message; return; }
         timer.Interval=decimal.ToInt32(interval.Value*1000m);
         pending=true; Editing(false); toggle.Text="감지 정지";
         status.Text="기준 화면 준비 중…"; timer.Start();
     }
-    void Editing(bool enabled) { select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=repetitions.Enabled=cooldown.Enabled=editor.Enabled=linked.Enabled=testMacro.Enabled=enabled; }
+    void Editing(bool enabled) { select.Enabled=bind.Enabled=tolerance.Enabled=interval.Enabled=repetitions.Enabled=cooldown.Enabled=editor.Enabled=linked.Enabled=testMacro.Enabled=restrictMouse.Enabled=chooseMouseArea.Enabled=enabled; }
     void Stop(string text) {
         timer.Stop(); pending=false; detector.Dispose();
         if(execution!=null)execution.Cancel();
@@ -227,6 +250,7 @@ public sealed class Panel : Form {
     }
     MacroStep[] ValidateMacro() {
         MacroStep[] steps=editor.Snapshot();
+        if(armedMouseOnly)steps=MouseScope.Prepare(steps,armedMouseArea);
         foreach(MacroStep step in steps) if((step.Kind==StepKind.Key || step.Kind==StepKind.KeyDown || step.Kind==StepKind.KeyUp) && (step.Key&Keys.KeyCode)==(hotkey&Keys.KeyCode))
             throw new ArgumentException("매크로 키와 감지 ON/OFF 단축키를 다르게 설정하세요.");
         return steps;
@@ -234,11 +258,23 @@ public sealed class Panel : Form {
     void TestMacro() {
         if(macroRunning || pending || detector.Active || capturingKey || editor.Picking)return;
         try {
-            armedSteps=ValidateMacro(); armedRepeats=editor.Repeats;
+            ArmMouseScope(); armedSteps=ValidateMacro(); armedRepeats=editor.Repeats;
             foreach(MacroStep step in armedSteps) if(step.Kind==StepKind.DetectedClick)throw new ArgumentException("변화 위치 클릭 동작은 실제 감지 후에만 사용할 수 있습니다.");
             RunMacro(Point.Empty,true);
         } catch(ArgumentException ex) { status.Text=ex.Message; }
     }
+    void ArmMouseScope() {
+        armedMouseOnly=restrictMouse.Checked; armedMouseArea=mouseArea;
+        if(armedMouseOnly && !RegionValid(armedMouseArea))throw new ArgumentException("유효한 화면 안에서 마우스 작동 영역을 지정하세요.");
+    }
+    void ExecuteMacroInput(MacroStep step,Point detected) {
+        if(armedMouseOnly) {
+            if(!RegionValid(armedMouseArea))throw new InvalidOperationException("작동 영역의 화면 구성이 변경되어 정지했습니다.");
+            MouseScope.RequireStep(armedMouseArea,step,detected);
+        }
+        Native.Execute(step,detected);
+    }
+    void ReleaseMacroInput() { Native.ReleaseHeld(armedMouseOnly?(Rectangle?)armedMouseArea:null); }
     async void RunMacro(Point target,bool manual) {
         timer.Stop(); macroRunning=true; Editing(false); toggle.Text="매크로 정지";
         CancellationTokenSource current=new CancellationTokenSource(); execution=current;
@@ -247,15 +283,15 @@ public sealed class Panel : Form {
             if(manual) { status.Text="2초 후 테스트 · 입력할 창을 선택하세요."; await Task.Delay(2000,current.Token); }
             for(int pass=0;pass<armedRepeats;pass++) {
                 int iteration=pass;
-                try { await MacroRunner.RunAsync(armedSteps,target,Native.Execute,current.Token,
+                try { await MacroRunner.RunAsync(armedSteps,target,ExecuteMacroInput,current.Token,
                     delegate(int i) { status.Text=string.Format("매크로 {0}/{1}회 · {2}/{3}단계",iteration+1,armedRepeats,i+1,armedSteps.Length); },
                     delegate(int ms,CancellationToken token) { return Task.Delay(ms,token); }); }
-                finally { Native.ReleaseHeld(); }
+                finally { ReleaseMacroInput(); }
             }
         } catch(OperationCanceledException) { failure="매크로 정지 · 남은 동작 취소"; }
         catch(Exception ex) { failure="매크로 오류: "+ex.Message; }
         finally {
-            Native.ReleaseHeld(); execution=null; current.Dispose(); macroRunning=false;
+            ReleaseMacroInput(); execution=null; current.Dispose(); macroRunning=false;
             if(!IsDisposed && !Disposing) {
                 toggle.Enabled=true;
                 if(failure!=null)Stop(failure);
@@ -273,12 +309,14 @@ public sealed class Panel : Form {
     void Tick() {
         try {
             if(!RegionValid()) { Stop("화면 구성이 변경되어 정지했습니다."); return; }
+            if(armedMouseOnly && !RegionValid(armedMouseArea)) { Stop("마우스 작동 영역의 화면 구성이 변경되어 정지했습니다."); return; }
             if(WindowState!=FormWindowState.Minimized && Bounds.IntersectsWith(region)) { Stop("패널이 감지 영역에 겹쳐 정지했습니다."); return; }
             using(Bitmap image=CaptureRegion()) {
                 if(pending) { detector.Start(image,(int)repetitions.Value,decimal.ToInt32(cooldown.Value*1000m)); pending=false; DetectionStatus(); return; }
                 Point target=Point.Empty;
                 bool clicked=detector.Check(image,(int)tolerance.Value,delegate(Point local) {
                     target=new Point(region.X+local.X,region.Y+local.Y);
+                    if(armedMouseOnly)MouseScope.RequirePoint(armedMouseArea,target);
                     Native.Click(target);
                 });
                 if(clicked && armedSteps.Length>0)RunMacro(target,false);
